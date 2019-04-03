@@ -1,0 +1,14 @@
+slack_congig:
+  token: xoxp-xxxx
+slack_channel:
+  default: '#default_channel'
+  close_issue: '#issue_channel'
+  reopen_issue: '#issue_channel'
+  new_issue: '#issue_channel'
+  update_assignes: '#channel'
+  update_labels: '#channel'
+  new_comment: '#channel'
+slack_users:
+  GitLab_User1: Slack_User1
+  GitLab_User2: Slack_User2
+  GitLab_User3: Slack_User3
