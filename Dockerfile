@@ -2,10 +2,10 @@ FROM python:alpine
 
 EXPOSE 5000
 
-COPY requirements.txt ./
+WORKDIR /app
+
+COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
-CMD [ "python", "./app.py" ]
+CMD [ "python", "/app/app.py" ]
