@@ -13,3 +13,12 @@ Comment processing (sends messages if you are):
    - Assignee
    - Author
    - Someone mentioned
+
+Instalation Dockerfile
+```
+FROM stelsik/gitlabtoslack
+
+COPY config.yaml /app
+```
+
+Add WebHook in you GitLab
