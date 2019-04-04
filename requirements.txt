@@ -1,3 +1,4 @@
 slackclient
 cached_property
 Flask==1.0.2
+pyyaml
