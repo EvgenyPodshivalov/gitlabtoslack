@@ -1,11 +1,16 @@
-slack_congig:
+gitlab:
+  # Optional. Leave empty to disable token validation.
+  token: ""
+slack_config:
   token: xoxp-xxxx
+# slack_congig is still supported for legacy configs.
 slack_channel:
   default: '#default_channel'
   close_issue: '#issue_channel'
   reopen_issue: '#issue_channel'
   new_issue: '#issue_channel'
-  update_assignes: '#channel'
+  # update_assignes is supported for legacy configs.
+  update_assignees: '#channel'
   update_labels: '#channel'
   new_comment: '#channel'
 slack_users:
