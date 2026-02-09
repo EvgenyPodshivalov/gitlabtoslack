@@ -1,264 +1,380 @@
 #!/usr/bin/env python3
 
-import os
 import json
-import yaml
-from urllib.parse import urlencode
+import os
 
-from flask import Flask
-from flask import redirect
-from flask import request
-from flask import make_response
+import yaml
+from flask import Flask, make_response, request
 from slackclient import SlackClient
 
-EVENT_API_FIELD_TYPE = "X-Gitlab-Token"
-EVENT_API_FIELD_TOKEN = "token"
-EVENT_API_FIELD_CHALLENGE = "challenge"
+GITLAB_TOKEN_HEADER = "X-Gitlab-Token"
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+DEFAULT_SLACK_USER = os.getenv("DEFAULT_SLACK_USER", "epodshivalov")
 
-EVENT_API_REQ_TYPE_URL_VERIFICATION = "12345678"
-EVENT_API_REQ_TYPE_EVENT = "event_callback"
+users_cache = {}
 
-users_list = {}
-cfg = yaml.load(open('config.yaml'), Loader=yaml.SafeLoader)
+
+def load_config(path):
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            return yaml.safe_load(config_file) or {}
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Config file not found: {path}") from exc
+
+
+cfg = load_config(CONFIG_PATH)
 
 app = Flask(__name__)
 
 
-class UnsupportedRequestException(BaseException):
-    pass
+def get_slack_config():
+    return cfg.get("slack_config") or cfg.get("slack_congig") or {}
 
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook():
-    """Endpoint for event callbacks from slack"""
-    req = request.get_json(silent=True, force=True)
-    print("Got WebHook Request:", json.dumps(req, indent=4))
-    return process_event_api_request(request)
 
-# def handle_errors(func):
-#     """Decorator for functions that take single request argument and return dict response."""
-#     def error_handling_wrapper(req):
-#         try:
-#             response = func(req)
-#             print("Responding:", response)
-#         except UnsupportedRequestException:
-#             print("UnsupportedRequestException:", req)
-#             response = make_response("Unsupported request %s" % req, 400)
-#         except Exception as exc:
-#             print("Exception", exc)
-#             response = make_response("Unknown error", 500)
-#         return response
+def get_slack_token():
+    return get_slack_config().get("token", "")
 
-#     return error_handling_wrapper
+
+def get_slack_users():
+    return cfg.get("slack_users") or {}
+
+
+def get_channel(*names):
+    channels = cfg.get("slack_channel") or {}
+    for name in names:
+        channel = channels.get(name)
+        if channel:
+            return channel
+    return channels.get("default", "")
+
+
+def get_gitlab_token():
+    gitlab_cfg = cfg.get("gitlab") or {}
+    return gitlab_cfg.get("token") or cfg.get("token") or ""
+
+
+def join_items(items):
+    return "|".join(item for item in (items or []) if item)
+
+
+def extract_assignee_names_from_list(assignees):
+    return [assignee.get("name", "") for assignee in (assignees or []) if assignee.get("name")]
+
+
+def extract_assignee_names(req):
+    return extract_assignee_names_from_list(req.get("assignees") or req.get("assignes") or [])
+
+
+def extract_label_titles_from_list(labels):
+    return [label.get("title", "") for label in (labels or []) if label.get("title")]
+
+
+def extract_label_titles(req):
+    return extract_label_titles_from_list(req.get("labels") or [])
+
+
+def build_base_message(req):
+    object_attrs = req.get("object_attributes") or {}
+    user = req.get("user") or {}
+    return {
+        "sendto": get_channel("default"),
+        "name": user.get("name", ""),
+        "project": (req.get("project") or {}).get("path_with_namespace", ""),
+        "issue_url": object_attrs.get("url", ""),
+        "issue_title": object_attrs.get("title", ""),
+        "icon": user.get("avatar_url") or ":ghost:",
+        "issue": object_attrs.get("iid") or object_attrs.get("noteable_id") or "",
+    }
+
+
+def record_user(req):
+    user = req.get("user") or {}
+    object_attrs = req.get("object_attributes") or {}
+    user_id = user.get("id") or object_attrs.get("author_id")
+    username = user.get("username") or ""
+    if not user_id or not username:
+        return
+    users_cache[user_id] = {"name": user.get("name", ""), "username": username}
+
+
+def list_diff(current, previous):
+    added = [item for item in current if item not in previous]
+    removed = [item for item in previous if item not in current]
+    return added, removed
+
+
+def process_event_close_issue(req, slack_msg):
+    slack_msg["sendto"] = get_channel("close_issue")
+    slack_msg["action"] = (req.get("object_attributes") or {}).get("action", "")
+    slack_msg["text"] = (
+        "[{project}] *{action}* issue #{issue}: <{issue_url}|{issue_title}>\n"
+    ).format(**slack_msg)
+
+
+def process_event_reopen_issue(req, slack_msg):
+    slack_msg["sendto"] = get_channel("reopen_issue")
+    slack_msg["action"] = (req.get("object_attributes") or {}).get("action", "")
+    slack_msg["text"] = (
+        "[{project}] *{action}* issue #{issue}: <{issue_url}|{issue_title}>\n"
+    ).format(**slack_msg)
+
+
+def process_event_new_issue(req, slack_msg):
+    slack_msg["sendto"] = get_channel("new_issue")
+    object_attrs = req.get("object_attributes") or {}
+    slack_msg["action"] = object_attrs.get("action", "")
+    slack_msg["issue_descr"] = object_attrs.get("description") or ""
+    slack_msg["issue_assignees"] = join_items(extract_assignee_names(req))
+    slack_msg["issue_labels"] = join_items(extract_label_titles(req))
+    slack_msg["text"] = (
+        "[{project}] {action} issue #{issue}: <{issue_url}|{issue_title}>\n"
+        "Assignees: {issue_assignees}\n"
+        "Labels: {issue_labels}\n"
+        ">>>{issue_descr}"
+    ).format(**slack_msg)
+
+
+def process_event_update_issue_assignees(req, slack_msg):
+    slack_msg["sendto"] = get_channel("update_assignees", "update_assignes")
+    changes = req.get("changes") or {}
+    assignees_change = changes.get("assignees") or {}
+    previous = extract_assignee_names_from_list(assignees_change.get("previous"))
+    current = extract_assignee_names_from_list(assignees_change.get("current"))
+    slack_msg["issue_assignees"] = join_items(extract_assignee_names(req))
+    slack_msg["text"] = (
+        "[{project}] Assignees changed on issue #{issue}: <{issue_url}|{issue_title}>\n"
+        "Assigned: {issue_assignees}\n"
+    ).format(**slack_msg)
+    added, removed = list_diff(current, previous)
+    if added:
+        slack_msg["text"] += "`Add: {}`\n".format(join_items(added))
+    if removed:
+        slack_msg["text"] += "`Del: {}`\n".format(join_items(removed))
+
+
+def process_event_update_issue_labels(req, slack_msg):
+    slack_msg["sendto"] = get_channel("update_labels")
+    changes = req.get("changes") or {}
+    labels_change = changes.get("labels") or {}
+    previous = extract_label_titles_from_list(labels_change.get("previous"))
+    current = extract_label_titles_from_list(labels_change.get("current"))
+    slack_msg["issue_labels"] = join_items(extract_label_titles(req))
+    slack_msg["text"] = (
+        "[{project}] Labels changed on issue #{issue}: <{issue_url}|{issue_title}>\n"
+        "Labels: {issue_labels}\n"
+    ).format(**slack_msg)
+    added, removed = list_diff(current, previous)
+    if added:
+        slack_msg["text"] += "`Add: {}`\n".format(join_items(added))
+    if removed:
+        slack_msg["text"] += "`Del: {}`\n".format(join_items(removed))
+
+
+def process_event_new_comment(req, slack_msg):
+    slack_msg["sendto"] = get_channel("new_comment")
+    object_attrs = req.get("object_attributes") or {}
+    issue = req.get("issue") or {}
+    slack_msg["issue"] = object_attrs.get("noteable_id") or slack_msg.get("issue", "")
+    slack_msg["comment"] = object_attrs.get("note") or ""
+    slack_msg["issue_title"] = issue.get("title") or slack_msg.get("issue_title", "")
+    slack_msg["text"] = (
+        "[{project}] New comment on issue #{issue}: <{issue_url}|{issue_title}>\n"
+        ">>>{comment}"
+    ).format(**slack_msg)
+
+
+def send_to_slack(
+    message="",
+    user="",
+    username="GitLab bot",
+    emoji=":uit:",
+    icon_url="",
+    icon_emoji=":ghost:",
+    override_debug=False,
+):
+    slack_token = get_slack_token()
+    if not slack_token:
+        print("Slack token missing, skipping message")
+        return
+    user = user or DEFAULT_SLACK_USER
+    icon_emoji = icon_emoji or emoji
+    slack_client = SlackClient(slack_token)
+    icon_emoji_value = icon_emoji if not icon_url else None
+    if user.startswith("#"):
+        slack_client.api_call(
+            "chat.postMessage",
+            channel=user,
+            text=message,
+            username=username,
+            icon_url=icon_url,
+            icon_emoji=icon_emoji_value,
+            as_user=False,
+        )
+        return
+
+    users_response = slack_client.api_call("users.list")
+    if not users_response.get("ok"):
+        print("Slack users.list failed:", users_response)
+        return
+    for member in users_response.get("members", []):
+        if member.get("profile", {}).get("real_name") == user:
+            user_id = member.get("id")
+            if not user_id:
+                break
+            im_response = slack_client.api_call("im.open", user=user_id)
+            if not im_response.get("ok"):
+                print("Slack im.open failed:", im_response)
+                break
+            channel_id = (im_response.get("channel") or {}).get("id")
+            if channel_id:
+                slack_client.api_call(
+                    "chat.postMessage",
+                    channel=channel_id,
+                    text=message,
+                    username=username,
+                    icon_url=icon_url,
+                    icon_emoji=icon_emoji_value,
+                    as_user=False,
+                )
+                slack_client.api_call("im.close", channel=channel_id)
+            break
+
+
+def get_user_id(val):
+    return [key for key, value in users_cache.items() if val == value.get("username")]
+
+
+def is_note_event(req):
+    return req.get("object_kind") == "note" and req.get("event_type") == "note"
+
+
+def is_issue_event(req, action=None):
+    if req.get("object_kind") != "issue" or req.get("event_type") != "issue":
+        return False
+    if action is None:
+        return True
+    return (req.get("object_attributes") or {}).get("action") == action
+
+
+def collect_comment_user_ids(req):
+    comment_user_ids = []
+    issue = req.get("issue") or {}
+    if issue.get("author_id"):
+        comment_user_ids.append(issue.get("author_id"))
+    if issue.get("assignee_id"):
+        comment_user_ids.append(issue.get("assignee_id"))
+    slack_note = str((req.get("object_attributes") or {}).get("note", "")).replace("\\", "")
+    slack_users = get_slack_users()
+    for slack_user in slack_users:
+        if slack_user in slack_note:
+            comment_user_ids.extend(get_user_id(slack_user))
+    return list(set(comment_user_ids))
+
+
+def resolve_recipients(comment_user_ids, default_channel):
+    if not comment_user_ids:
+        return [default_channel] if default_channel else []
+    slack_users = get_slack_users()
+    recipients = []
+    seen = set()
+    for comment_user_id in comment_user_ids:
+        user_info = users_cache.get(comment_user_id)
+        if not user_info:
+            continue
+        username = user_info.get("username")
+        if username in slack_users:
+            slack_name = slack_users[username]
+            if slack_name and slack_name not in seen:
+                recipients.append(slack_name)
+                seen.add(slack_name)
+    return recipients
+
+
+def process_gitlab_event(req):
+    slack_msg = build_base_message(req)
+    record_user(req)
+
+    comment_user_ids = []
+    if is_note_event(req):
+        process_event_new_comment(req, slack_msg)
+        comment_user_ids = collect_comment_user_ids(req)
+    elif is_issue_event(req, "update") and "labels" in (req.get("changes") or {}):
+        process_event_update_issue_labels(req, slack_msg)
+    elif is_issue_event(req, "close"):
+        process_event_close_issue(req, slack_msg)
+    elif is_issue_event(req, "reopen"):
+        process_event_reopen_issue(req, slack_msg)
+    elif is_issue_event(req, "update") and "assignees" in (req.get("changes") or {}):
+        process_event_update_issue_assignees(req, slack_msg)
+    elif is_issue_event(req, "open"):
+        process_event_new_issue(req, slack_msg)
+
+    if slack_msg.get("text"):
+        recipients = resolve_recipients(comment_user_ids, slack_msg.get("sendto", ""))
+        print(recipients)
+        for slack_name in recipients:
+            if slack_name:
+                send_to_slack(
+                    message=slack_msg["text"],
+                    user=slack_name,
+                    icon_url=slack_msg["icon"],
+                    username=slack_msg["name"],
+                )
+
+    if req.get("challenge"):
+        return {"challenge": req.get("challenge")}
+    return {"ok": True}
+
+
+def process_handshake_request(req):
+    return process_gitlab_event(req)
+
 
 def wrap_plain_json(func):
     """Make a proper response object of plain dict/json.
-    Wraps function that takes single request argument and return dict response"""
-    def json_wrapper(req):
-        # main call performed here
-        response_body_json = func(req)
+    Wraps function that returns dict response."""
 
-        response_body = json.dumps(response_body_json)
-        response = make_response(response_body)
-        response.headers['Content-Type'] = 'application/json'
+    def json_wrapper(*args, **kwargs):
+        response_body = func(*args, **kwargs)
+        if isinstance(response_body, tuple):
+            response_body, status_code = response_body
+        else:
+            status_code = 200
+        response = make_response(json.dumps(response_body), status_code)
+        response.headers["Content-Type"] = "application/json"
         return response
 
     return json_wrapper
 
-# @handle_errors
+
 @wrap_plain_json
-def process_event_api_request(req):
-    request_type = req.headers.get(EVENT_API_FIELD_TYPE)
-    if request_type == EVENT_API_REQ_TYPE_URL_VERIFICATION:
-        return process_handshake_request(req.get_json(silent=True, force=True))
-    elif request_type == EVENT_API_REQ_TYPE_EVENT:
-        return process_event_request(req)
-    else:
-        raise UnsupportedRequestException
+def process_event_api_request(req, payload=None):
+    if req.method == "GET":
+        return {"ok": True}
+    if payload is None:
+        payload = req.get_json(silent=True, force=True)
+    if not payload or not isinstance(payload, dict):
+        return {"error": "Invalid JSON payload"}, 400
+    expected_token = get_gitlab_token()
+    if expected_token:
+        provided_token = req.headers.get(GITLAB_TOKEN_HEADER, "")
+        if provided_token != expected_token:
+            return {"error": "Invalid token"}, 403
+    try:
+        return process_gitlab_event(payload)
+    except Exception as exc:
+        print("Exception", exc)
+        return {"error": "Internal error"}, 500
 
-def process_event_request(req):
-    """Process even received request from Slack Events API"""
-    message_processor.process_incoming_event(req)
-    return {}
 
-def process_event_close_issue(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['close_issue'] or cfg['slack_channel']['default']
-    SlackMsg['action'] = req.get('object_attributes', {}).get('action') or ''
-    SlackMsg['text'] = '[{project}] *{action}* issue #{issue}: <{issue_url}|{issue_title}>\n'.format(**SlackMsg)
+@app.route("/webhook", methods=["POST", "GET"])
+def webhook():
+    """Endpoint for event callbacks from GitLab."""
+    payload = request.get_json(silent=True, force=True)
+    print("Got WebHook Request:", json.dumps(payload, indent=4))
+    return process_event_api_request(request, payload)
 
-def process_event_reopen_issue(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['reopen_issue'] or cfg['slack_channel']['default']
-    SlackMsg['action'] = req.get('object_attributes', {}).get('action') or ''
-    SlackMsg['text'] = '[{project}] *{action}* issue #{issue}: <{issue_url}|{issue_title}>\n'.format(**SlackMsg)
 
-def process_event_new_issue(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['new_issue'] or cfg['slack_channel']['default']
-    assignes_list = []
-    labels_list = []
-    if req.get('assignes', None):
-        for issues in req['assignees']:
-            assignes_list.append(issues['name'])
-    if req.get('labels', None):
-        for labels in req['labels']:
-            labels_list.append(labels['title'])
-    SlackMsg['action'] = req.get('object_attributes', {}).get('action') or ''
-    SlackMsg['issue_descr'] = req.get('object_attributes', {}).get('description') or ''
-    SlackMsg['issue_assignes'] = '|'.join(assignes_list)
-    SlackMsg['issue_labels'] = '|'.join(labels_list)
-    SlackMsg['text'] = '[{project}] {action} issue #{issue}: <{issue_url}|{issue_title}>\nAssignes: {issue_assignes}\nLabels: {issue_labels}\n>>>{issue_descr}'.format(**SlackMsg)
-
-def process_event_update_issue_assignes(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['update_assignes'] or cfg['slack_channel']['default']
-    issue_prev, issue_curr, assignes_list = [], [], []
-    for issue_previous in req['changes']['assignees']['previous']:
-        issue_prev.append(issue_previous['name'])
-    for issue_current in req['changes']['assignees']['current']:
-        issue_curr.append(issue_current['name'])
-    for issues in req['assignees']:
-        assignes_list.append(issues['name'])
-    SlackMsg['issue_assignes'] = '|'.join(assignes_list)
-    SlackMsg['text'] = '[{project}] Assignees changes on issue #{issue}: <{issue_url}|{issue_title}>\Assigned: {issue_assignes}\n'.format(**SlackMsg)
-    if list(set(issue_prev) - set(issue_curr)):
-        SlackMsg['text'] += '`Del: {}`\n'.format('|'.join(list(set(issue_prev) - set(issue_curr))))
-
-def process_event_update_issue_labels(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['update_labels'] or cfg['slack_channel']['default']
-    labels_prev, labels_current, labels_list = [], [], []
-    for issue_labels_previous in req['changes']['labels']['previous']:
-        labels_prev.append(issue_labels_previous['title'])
-    for issue_labels_current in req['changes']['labels']['current']:
-        labels_current.append(issue_labels_current['title'])
-    for labels in req['labels']:
-        labels_list.append(labels['title'])
-    SlackMsg['issue_labels'] = '|'.join(labels_list)
-    SlackMsg['text'] = '[{project}]  Labels changes on issue #{issue}: <{issue_url}|{issue_title}>\nLabels: {issue_labels}\n'.format(**SlackMsg)
-    if list(set(labels_current) - set(labels_prev)):
-        SlackMsg['text'] += '`Add: {}`\n'.format(
-                '|'.join(list(set(labels_current) - set(labels_prev)))
-            )
-    if list(set(labels_prev) - set(labels_current)):
-        SlackMsg['text'] += '`Del: {}`\n'.format(
-                '|'.join(list(set(labels_prev) - set(labels_current)))
-            )
-
-def process_event_new_comment(req, SlackMsg):
-    SlackMsg['sendto'] = cfg['slack_channel']['new_comment'] or cfg['slack_channel']['default']
-    SlackMsg['issue'] = req.get('object_attributes', {}).get('noteable_id') or ''
-    SlackMsg['comment'] = req.get('object_attributes', {}).get('note') or ''
-    SlackMsg['issue_title'] =  req.get('issue', {}).get('title') or ''
-    SlackMsg['text'] = '[{project}] New comment on issue #{issue}: <{issue_url}|{issue_title}>\n>>>{comment}'.format(**SlackMsg)
-
-def send_to_slack (message='', user='', username='GitLab bot', emoji=':uit:', icon_url='', icon_emoji=':ghost:', override_debug=False):
-    sc = SlackClient(cfg['slack_congig']['token'])
-    if user == '':
-        user='epodshivalov'
-
-    if user[0] == '#':
-        sc.api_call(
-                "chat.postMessage",
-                channel = user,
-                text = message,
-                username = username,
-                icon_url = icon_url,
-                icon_emoji = icon_emoji if icon_url == '' else None,
-                as_user = 'false',
-            )
-    else:
-        sc_users = sc.api_call('users.list')
-        if 'ok' in sc_users:
-            for sc_members in sc_users['members']:
-                if sc_members['profile']['real_name'] == user:
-                    sc_sendtouser = sc_members['id']
-                    sc_im = sc.api_call('im.open', user=sc_sendtouser)
-                    if 'ok' in sc_im:
-                        sc.api_call(
-                                "chat.postMessage",
-                                channel = sc_im['channel']['id'],
-                                text = message,
-                                username = username,
-                                icon_url = icon_url,
-                                icon_emoji = icon_emoji if icon_url == '' else None,
-                                as_user = 'false',
-                            )
-                    sc.api_call('im.close', channel = sc_im['channel']['id'])
-                    break
-
-def get_user_id(val):
-    keylist = []
-    for key, value in users_list.items():
-        if val == value['username']:
-            keylist.append(key)
-    return keylist
-
-def process_handshake_request(req):
-    """Process handshake request from Slack Events API"""
-    global users_list
-    global cfg
-    SlackMsg = {}
-    current_user = {}
-    comment_users_list, slack_users_list = [], []
-    SlackMsg['sendto'] = cfg['slack_channel']['default']
-    SlackMsg['name'] = req.get('user', {}).get('name') or ''
-    SlackMsg['project'] = req.get('project', {}).get('path_with_namespace') or ''
-    SlackMsg['issue_url'] = req.get('object_attributes', {}).get('url') or ''
-    SlackMsg['issue_title'] = req.get('object_attributes', {}).get('title') or ''
-    SlackMsg['icon'] = req.get('user', {}).get('avatar_url') or ':ghost:'
-    SlackMsg['issue'] = req.get('object_attributes', {}).get('iid') or req.get('object_attributes', {}).get('noteable_id') or ''
-
-    #Learning gitlab usernames and IDs
-    if 'user' in req:
-        userid = req.get('user', {}).get('id') or req.get('object_attributes', {}).get('author_id') or 0
-        current_user['name'] = req.get('user', {}).get('name') or ''
-        current_user['username'] = req.get('user', {}).get('username') or ''
-        if current_user['username'] != '':
-            if users_list.get(userid, {}):
-                users_list[userid]['name'] = current_user['name']
-                users_list[userid]['username'] = current_user['username']
-            else:
-                users_list[userid] = current_user
-    ###
-
-    if (req['object_kind'] == 'note') and (req['event_type'] == 'note'):
-        process_event_new_comment(req, SlackMsg)
-        #Finding users
-        if req.get('issue', {}).get('author_id', {}):
-            comment_users_list.append(req.get('issue', {}).get('author_id'))
-        if req.get('issue', {}).get('assignee_id', {}):
-            comment_users_list.append(req.get('issue', {}).get('assignee_id'))
-        #Finding assgnee in note
-        slack_note = str(req['object_attributes']['note']).replace('\\', '')
-        for slack_user in cfg['slack_users']:
-            if slack_note.find(slack_user) != -1:
-                comment_users_list += get_user_id(slack_user)
-        comment_users_list = list(set(comment_users_list))
-    elif (req['object_kind'] == 'issue') and (req['event_type'] == 'issue') and (req['object_attributes']['action'] == 'update') and ('labels' in  req['changes']):
-        process_event_update_issue_labels(req, SlackMsg)
-    elif (req['object_kind'] == 'issue') and (req['event_type'] == 'issue') and (req['object_attributes']['action'] == 'close'):
-        process_event_close_issue(req, SlackMsg)
-    elif (req['object_kind'] == 'issue') and (req['event_type'] == 'issue') and (req['object_attributes']['action'] == 'reopen'):
-        process_event_reopen_issue(req, SlackMsg)
-    elif (req['object_kind'] == 'issue') and (req['event_type'] == 'issue') and (req['object_attributes']['action'] == 'update') and ('assignees' in  req['changes']):
-        process_event_update_issue_assignes(req, SlackMsg)
-    elif (req['object_kind'] == 'issue') and (req['event_type'] == 'issue') and (req['object_attributes']['action'] == 'open'):
-        process_event_new_issue(req, SlackMsg)
-    else:
-        pass
-
-    if SlackMsg.get('text', None):
-        if comment_users_list == []:
-            slack_users_list.append(SlackMsg['sendto'])
-        else:
-            for comment_user_id in comment_users_list:
-                if comment_user_id in users_list:
-                    if users_list[comment_user_id]['username'] in cfg['slack_users']:
-                        slack_users_list.append(cfg['slack_users'][users_list[comment_user_id]['username']])
-        
-        print (slack_users_list)
-        for slack_name in slack_users_list:
-            if slack_name:
-                send_to_slack(message=SlackMsg['text'], user=slack_name, icon_url=SlackMsg['icon'], username=SlackMsg['name'])
-
-    return {"challenge": req.get(EVENT_API_FIELD_CHALLENGE)}
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(debug=False, port=port, host='0.0.0.0')
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(debug=False, port=port, host="0.0.0.0")
